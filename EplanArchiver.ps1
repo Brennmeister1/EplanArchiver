@@ -2,7 +2,9 @@
 # EPLAN Projekt-/Benutzerliste
 # ============================================================================
 # Durchsucht ein Verzeichnis nach EPLAN-Projekten (.elk/.edb und .zw1),
-# liest die ProjektInfo.xml und sammelt Projektname + Benutzer-E-Mail-Adressen.
+# liest die ProjectInfo.xml und sammelt Projektname + Benutzer-E-Mail-Adressen.
+# Die Properties werden über ihre ID gelesen -> funktioniert für deutsche und
+# englische Projekte gleichermaßen.
 # Ergebnis: geordnete Listen als CSV (Excel-kompatibel, Trennzeichen ';').
 #
 # Es werden KEINE Projekte verschoben, kopiert oder verändert (nur Lesezugriff).
@@ -41,8 +43,19 @@ $Config = @{
     LogPath          = Join-Path $OutputPath "EPLAN_Archiver.log"
 }
 
-# Muster für E-Mail-Adressen
-$EmailRegex = [regex]'(?i)[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}'
+# Dateinamen der Projektinfo (beide Schreibweisen werden akzeptiert)
+$InfoFileNames = @('ProjectInfo.xml', 'ProjektInfo.xml')
+
+# EPLAN Property-IDs (sprachunabhängig, gleiche IDs in DE und EN)
+$PropId = @{
+    EditorName   = '3011'   # Letzter Bearbeiter: Name        / Last editor: Name
+    EditorEmail  = '3013'   # Letzter Bearbeiter: E-Mail      / Last editor: E-mail
+    ProjectPath  = '10009'  # Projektname (vollständig)       / Project name (full)
+    Creator      = '10020'  # Ersteller                       / Creator
+    CreationDate = '10021'  # Erstellungsdatum                / Creation date
+    EditorLogin  = '10022'  # Letzter Bearbeiter: Anmeldename / Last editor: Sign-in name
+    ModDate      = '10023'  # Änderungsdatum                  / Modification date
+}
 
 # ============================================================================
 # HILFSFUNKTIONEN
@@ -88,92 +101,67 @@ function ConvertFrom-UnixTimestamp {
     param([string]$UnixTimestamp)
 
     try {
-        return ([datetime]'1970-01-01 00:00:00').AddSeconds([long]$UnixTimestamp)
+        # EPLAN speichert UTC -> in lokale Zeit umrechnen
+        return [DateTimeOffset]::FromUnixTimeSeconds([long]$UnixTimestamp).LocalDateTime
     }
     catch {
         return $null
     }
 }
 
-# Liefert den Property-Namen eines Knotens (Attribut name/id), falls vorhanden
-function Get-PropertyLabel {
-    param([System.Xml.XmlNode]$Node)
+# Liest den Wert einer Property über ihre ID (index="0").
+# Bewusst per Regex statt XML-Parser: robust gegen nicht wohlgeformte Inhalte
+# (z. B. unmaskierte "<1100>"-Werte) und unabhängig von der Sprache.
+function Get-PropValue {
+    param([string]$Text, [string]$Id)
 
-    foreach ($AttrName in @('name', 'Name', 'id', 'ID')) {
-        if ($Node.Attributes -and $Node.Attributes[$AttrName]) {
-            return $Node.Attributes[$AttrName].Value
-        }
+    $Pattern = '<Property\b(?=[^>]*\bid="' + $Id + '")(?=[^>]*\bindex="0")[^>]*?(?:/>|>(?<v>.*?)</Property>)'
+    $M = [regex]::Match($Text, $Pattern, 'Singleline')
+    if ($M.Success -and $M.Groups['v'].Success) {
+        return [System.Net.WebUtility]::HtmlDecode($M.Groups['v'].Value).Trim()
     }
-    return $Node.LocalName
+    return ""
 }
 
-# Wertet den XML-Inhalt einer ProjektInfo.xml aus:
-# alle E-Mail-Adressen (aus Elementtexten und Attributen) + Änderungsdatum
-function Get-ProjectInfoFromXmlContent {
-    param(
-        [xml]$XmlContent,
-        [string]$ProjectName
-    )
+# Wertet den Inhalt einer ProjectInfo.xml aus
+function Get-ProjectInfoFromText {
+    param([string]$Text)
 
-    $Emails = @{}   # Key = E-Mail (klein), Value = Liste der Fundstellen
+    if ($Text -notmatch '<Property\b') { throw "Keine EPLAN-Properties in der Datei gefunden" }
 
-    foreach ($Node in $XmlContent.SelectNodes("//*")) {
-        # Nur direkter Text des Knotens (nicht der Kinder)
-        $OwnText = ($Node.ChildNodes |
-            Where-Object { $_.NodeType -eq 'Text' -or $_.NodeType -eq 'CDATA' } |
-            ForEach-Object { $_.Value }) -join ' '
-
-        $Sources = @()
-        if ($OwnText) { $Sources += , @($OwnText, (Get-PropertyLabel $Node)) }
-        if ($Node.Attributes) {
-            foreach ($Attr in $Node.Attributes) {
-                $Sources += , @($Attr.Value, "$(Get-PropertyLabel $Node)@$($Attr.Name)")
-            }
-        }
-
-        foreach ($Src in $Sources) {
-            foreach ($Match in $EmailRegex.Matches($Src[0])) {
-                $Mail = $Match.Value.ToLowerInvariant().TrimEnd('.')
-                if (-not $Emails.ContainsKey($Mail)) { $Emails[$Mail] = New-Object System.Collections.Generic.List[string] }
-                if (-not $Emails[$Mail].Contains($Src[1])) { $Emails[$Mail].Add($Src[1]) }
-            }
-        }
-    }
-
-    $ModificationDate = $null
-    $ModNode = $XmlContent.SelectSingleNode("//Property[@name='Modification date']")
-    if ($ModNode) { $ModificationDate = ConvertFrom-UnixTimestamp $ModNode.InnerText }
+    $Created  = Get-PropValue $Text $PropId.CreationDate
+    $Modified = Get-PropValue $Text $PropId.ModDate
 
     return @{
-        Emails           = $Emails
-        ModificationDate = $ModificationDate
+        EditorName       = Get-PropValue $Text $PropId.EditorName
+        EditorEmail      = (Get-PropValue $Text $PropId.EditorEmail).ToLowerInvariant()
+        EditorLogin      = Get-PropValue $Text $PropId.EditorLogin
+        Creator          = Get-PropValue $Text $PropId.Creator
+        ProjectPath      = Get-PropValue $Text $PropId.ProjectPath
+        CreationDate     = if ($Created)  { ConvertFrom-UnixTimestamp $Created }  else { $null }
+        ModificationDate = if ($Modified) { ConvertFrom-UnixTimestamp $Modified } else { $null }
     }
 }
 
-function Read-XmlFile {
+# Liest eine Datei als Text (Encoding per BOM erkannt, sonst UTF-8)
+function Read-InfoFile {
     param([string]$Path)
-    # Encoding aus der XML-Deklaration respektieren
-    $Doc = New-Object System.Xml.XmlDocument
-    $Doc.Load($Path)
-    return $Doc
+    return [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
 }
 
-function Read-XmlFromZip {
+# Liest die ProjectInfo.xml aus einem .zw1-Archiv (ZIP) als Text
+function Read-InfoFromZip {
     param([string]$ArchivePath)
 
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $Zip = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
     try {
-        $Entry = $Zip.Entries | Where-Object { $_.Name -eq "ProjektInfo.xml" } | Select-Object -First 1
+        $Entry = $Zip.Entries | Where-Object { $InfoFileNames -contains $_.Name } | Select-Object -First 1
         if (-not $Entry) { return $null }
 
-        $Stream = $Entry.Open()
-        try {
-            $Doc = New-Object System.Xml.XmlDocument
-            $Doc.Load($Stream)
-            return $Doc
-        }
-        finally { $Stream.Dispose() }
+        $Reader = New-Object System.IO.StreamReader($Entry.Open(), [System.Text.Encoding]::UTF8, $true)
+        try { return $Reader.ReadToEnd() }
+        finally { $Reader.Dispose() }
     }
     finally { $Zip.Dispose() }
 }
@@ -192,17 +180,21 @@ function Find-EplanProjects {
     $ElkFiles = Get-ChildItem -Path $SearchPath -Filter "*.elk" -Recurse -File -ErrorAction SilentlyContinue
     foreach ($ElkFile in $ElkFiles) {
         $ProjectName = [System.IO.Path]::GetFileNameWithoutExtension($ElkFile.Name)
-        $XmlPath     = Join-Path $ElkFile.Directory.FullName "$ProjectName.edb\ProjektInfo.xml"
+        $EdbDir      = Join-Path $ElkFile.Directory.FullName "$ProjectName.edb"
+        $XmlPath     = $InfoFileNames |
+            ForEach-Object { Join-Path $EdbDir $_ } |
+            Where-Object { Test-Path -LiteralPath $_ } |
+            Select-Object -First 1
 
-        if (-not (Test-Path $XmlPath)) {
-            Write-LogMessage "ProjektInfo.xml nicht gefunden für '$ProjectName': $XmlPath" "WARN"
-            $Results.Add(@{ ProjectName = $ProjectName; Type = "Projekt"; Path = $ElkFile.FullName; Info = $null; Error = "ProjektInfo.xml fehlt" })
+        if (-not $XmlPath) {
+            Write-LogMessage "ProjectInfo.xml nicht gefunden für '$ProjectName' in $EdbDir" "WARN"
+            $Results.Add(@{ ProjectName = $ProjectName; Type = "Projekt"; Path = $ElkFile.FullName; Info = $null; Error = "ProjectInfo.xml fehlt" })
             continue
         }
 
         try {
-            $Info = Get-ProjectInfoFromXmlContent -XmlContent (Read-XmlFile $XmlPath) -ProjectName $ProjectName
-            Write-LogMessage "Projekt '$ProjectName': $($Info.Emails.Count) E-Mail-Adresse(n)"
+            $Info = Get-ProjectInfoFromText (Read-InfoFile $XmlPath)
+            Write-LogMessage "Projekt '$ProjectName': $($Info.EditorName) <$($Info.EditorEmail)>"
             $Results.Add(@{ ProjectName = $ProjectName; Type = "Projekt"; Path = $ElkFile.FullName; Info = $Info; Error = "" })
         }
         catch {
@@ -216,18 +208,18 @@ function Find-EplanProjects {
     foreach ($ZwFile in $ZwFiles) {
         $ProjectName = [System.IO.Path]::GetFileNameWithoutExtension($ZwFile.Name)
         try {
-            $Doc = Read-XmlFromZip $ZwFile.FullName
-            if (-not $Doc) {
-                Write-LogMessage "ProjektInfo.xml nicht im Archiv '$ProjectName' gefunden" "WARN"
-                $Results.Add(@{ ProjectName = $ProjectName; Type = "Archiv"; Path = $ZwFile.FullName; Info = $null; Error = "ProjektInfo.xml fehlt im Archiv" })
+            $Text = Read-InfoFromZip $ZwFile.FullName
+            if (-not $Text) {
+                Write-LogMessage "ProjectInfo.xml nicht im Archiv '$ProjectName' gefunden" "WARN"
+                $Results.Add(@{ ProjectName = $ProjectName; Type = "Archiv"; Path = $ZwFile.FullName; Info = $null; Error = "ProjectInfo.xml fehlt im Archiv" })
                 continue
             }
-            $Info = Get-ProjectInfoFromXmlContent -XmlContent $Doc -ProjectName $ProjectName
-            Write-LogMessage "Archiv '$ProjectName': $($Info.Emails.Count) E-Mail-Adresse(n)"
+            $Info = Get-ProjectInfoFromText $Text
+            Write-LogMessage "Archiv '$ProjectName': $($Info.EditorName) <$($Info.EditorEmail)>"
             $Results.Add(@{ ProjectName = $ProjectName; Type = "Archiv"; Path = $ZwFile.FullName; Info = $Info; Error = "" })
         }
         catch {
-            Write-LogMessage "Archiv '$($ZwFile.FullName)' nicht lesbar (evtl. kein ZIP-Format): $_" "WARN"
+            Write-LogMessage "Archiv '$($ZwFile.FullName)' nicht lesbar: $_" "WARN"
             $Results.Add(@{ ProjectName = $ProjectName; Type = "Archiv"; Path = $ZwFile.FullName; Info = $null; Error = $_.Exception.Message })
         }
     }
@@ -236,43 +228,41 @@ function Find-EplanProjects {
     return $Results
 }
 
-# Liste 1: Projekt -> E-Mail (eine Zeile pro Kombination)
+function Format-Date {
+    param($Date)
+    if ($Date) { return $Date.ToString('dd.MM.yyyy HH:mm') }
+    return ""
+}
+
+# Liste 1: eine Zeile pro Projekt, sortiert nach Projektname
 function New-ProjectUserList {
     param($Projects)
 
     $Rows = foreach ($P in $Projects) {
-        $ModDate = if ($P.Info -and $P.Info.ModificationDate) { $P.Info.ModificationDate.ToString('dd.MM.yyyy HH:mm') } else { "" }
+        $I = $P.Info
+        if (-not $Config.IncludeProjectsWithoutEmail -and (-not $I -or -not $I.EditorEmail)) { continue }
 
-        if ($P.Info -and $P.Info.Emails.Count -gt 0) {
-            foreach ($Mail in $P.Info.Emails.Keys) {
-                [PSCustomObject]@{
-                    'Projektname'     = $P.ProjectName
-                    'E-Mail'          = $Mail
-                    'Fundstelle'      = ($P.Info.Emails[$Mail] -join ', ')
-                    'Typ'             = $P.Type
-                    'Letzte Änderung' = $ModDate
-                    'Pfad'            = $P.Path
-                    'Hinweis'         = $P.Error
-                }
-            }
-        }
-        elseif ($Config.IncludeProjectsWithoutEmail) {
-            [PSCustomObject]@{
-                'Projektname'     = $P.ProjectName
-                'E-Mail'          = ""
-                'Fundstelle'      = ""
-                'Typ'             = $P.Type
-                'Letzte Änderung' = $ModDate
-                'Pfad'            = $P.Path
-                'Hinweis'         = if ($P.Error) { $P.Error } else { "Keine E-Mail gefunden" }
-            }
+        $Hint = $P.Error
+        if (-not $Hint -and -not $I.EditorEmail) { $Hint = "Keine E-Mail hinterlegt" }
+
+        [PSCustomObject]@{
+            'Projektname'       = $P.ProjectName
+            'Letzter Bearbeiter'= if ($I) { $I.EditorName }  else { "" }
+            'E-Mail'            = if ($I) { $I.EditorEmail } else { "" }
+            'Anmeldename'       = if ($I) { $I.EditorLogin } else { "" }
+            'Ersteller'         = if ($I) { $I.Creator }     else { "" }
+            'Erstellt'          = if ($I) { Format-Date $I.CreationDate }     else { "" }
+            'Letzte Änderung'   = if ($I) { Format-Date $I.ModificationDate } else { "" }
+            'Typ'               = $P.Type
+            'Pfad'              = $P.Path
+            'Hinweis'           = $Hint
         }
     }
 
-    return @($Rows | Sort-Object 'Projektname', 'E-Mail', 'Pfad')
+    return @($Rows | Sort-Object 'Projektname', 'Pfad')
 }
 
-# Liste 2: E-Mail -> Projekte (eine Zeile pro Benutzer)
+# Liste 2: eine Zeile pro E-Mail mit allen zugehörigen Projekten
 function New-UserProjectList {
     param($ProjectRows)
 
@@ -282,10 +272,12 @@ function New-UserProjectList {
         Sort-Object Name |
         ForEach-Object {
             $Names = @($_.Group | Select-Object -ExpandProperty 'Projektname' | Sort-Object -Unique)
+            $User  = ($_.Group | Where-Object { $_.'Letzter Bearbeiter' } | Select-Object -First 1).'Letzter Bearbeiter'
             [PSCustomObject]@{
-                'E-Mail'        = $_.Name
-                'Anzahl'        = $Names.Count
-                'Projekte'      = ($Names -join ', ')
+                'E-Mail'   = $_.Name
+                'Name'     = $User
+                'Anzahl'   = $Names.Count
+                'Projekte' = ($Names -join ', ')
             }
         }
 }
@@ -325,7 +317,7 @@ function Start-EplanUserCollector {
     Export-List -Rows $ByProject -Path $Config.CsvByProjectPath
     Export-List -Rows $ByUser    -Path $Config.CsvByUserPath
 
-    $WithMail = @($Projects | Where-Object { $_.Info -and $_.Info.Emails.Count -gt 0 }).Count
+    $WithMail = @($Projects | Where-Object { $_.Info -and $_.Info.EditorEmail }).Count
     Write-LogMessage "ZUSAMMENFASSUNG:"
     Write-LogMessage "  Projekte gesamt:        $($Projects.Count)"
     Write-LogMessage "  davon mit E-Mail:       $WithMail"
@@ -342,12 +334,12 @@ Start-EplanUserCollector
 #   .\EplanArchiver.ps1 -SourcePath "\\server\EPLAN\Projekte" -OutputPath "C:\Temp"
 #
 # Ausgabe:
-#   EPLAN_Projekte_Benutzer.csv  - Projekt | E-Mail | Fundstelle | ... (sortiert nach Projekt)
-#   EPLAN_Benutzer_Projekte.csv  - E-Mail | Anzahl | Projekte (sortiert nach E-Mail)
+#   EPLAN_Projekte_Benutzer.csv  - Projekt | Letzter Bearbeiter | E-Mail | ... (sortiert nach Projekt)
+#   EPLAN_Benutzer_Projekte.csv  - E-Mail | Name | Anzahl | Projekte (sortiert nach E-Mail)
 #
-# Die Spalte "Fundstelle" zeigt, in welcher Property der ProjektInfo.xml die
-# Adresse stand (z. B. "Created by"). Damit lässt sich prüfen, ob die richtigen
-# Benutzerfelder erfasst werden.
+# Die Werte stammen aus der ProjectInfo.xml (Property-IDs siehe $PropId oben).
+# Die E-Mail ist die des letzten Bearbeiters (ID 3013); für den Ersteller
+# (ID 10020) speichert EPLAN nur die Kennung, keine E-Mail.
 #
 # Nur Lesezugriff, keine externen Abhängigkeiten (PowerShell 5.1+).
 # ============================================================================
