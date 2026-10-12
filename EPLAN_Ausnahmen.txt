@@ -1,0 +1,20 @@
+﻿# ============================================================================
+# EPLAN Ausnahmeliste
+# ============================================================================
+# Eine Ausnahme pro Zeile. Leere Zeilen und Zeilen mit # werden ignoriert.
+#
+# PFADE (alles, was einen \ oder / enthält):
+#   Der Ordner und alle Unterordner werden komplett übersprungen.
+#   Platzhalter * und ? sind erlaubt.
+#     J:\EPLAN\Projects\Prod\TestProjects
+#     J:\EPLAN\Projects\*\Archiv
+#     \\server\freigabe\EPLAN\Alt
+#
+# PROJEKTNUMMERN (alles ohne \ oder /):
+#   Wird mit dem Projektnamen (Dateiname ohne .elk/.zw1) verglichen,
+#   Groß-/Kleinschreibung egal. Platzhalter * und ? sind erlaubt.
+#     K998Y72
+#     K998*
+#     Neues Projekt*
+# ============================================================================
+
