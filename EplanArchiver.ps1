@@ -11,7 +11,7 @@
 #
 # Es werden KEINE Projekte verschoben, kopiert oder verändert (nur Lesezugriff).
 #
-# Version: 2.1
+# Version: 2.2
 # ============================================================================
 
 #Requires -Version 5.1
@@ -25,19 +25,29 @@ param(
     # Ausgabeverzeichnis für Listen und Log
     [string]$OutputPath = "C:\Temp",
 
-    # Ausnahmeliste (Pfade und Projektnummern, eine Zeile pro Eintrag)
-    [string]$ExclusionFile = (Join-Path $PSScriptRoot "EPLAN_Ausnahmen.txt"),
+    # Ausnahmeliste (Pfade und Projektnummern, eine Zeile pro Eintrag).
+    # Leer = EPLAN_Ausnahmen.txt neben dem Skript.
+    [string]$ExclusionFile = "",
 
     # Dry-Run: nur anzeigen, keine CSV-Dateien schreiben
     [switch]$DryRun,
 
     # Projekte ohne hinterlegte E-Mail-Adresse trotzdem aufführen
-    [bool]$IncludeProjectsWithoutEmail = $true
+    [bool]$IncludeProjectsWithoutEmail = $true,
+
+    # Pfad zu 7z.exe (für .zw1-Archive im 7z-Format). Leer = automatisch suchen.
+    [string]$SevenZipPath = ""
 )
 
 # ============================================================================
 # KONFIGURATION
 # ============================================================================
+
+# $PSScriptRoot ist in PS 5.1 in Parameter-Standardwerten noch leer -> hier auflösen
+if (-not $ExclusionFile) {
+    $ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+    $ExclusionFile = Join-Path $ScriptDir "EPLAN_Ausnahmen.txt"
+}
 
 $Config = @{
     # Mehrere Pfade per Komma (in der Konsole) oder ';' (z. B. Aufgabenplanung)
@@ -45,6 +55,7 @@ $Config = @{
                                     ForEach-Object { $_.Trim() } | Where-Object { $_ })
     ExclusionFile               = $ExclusionFile
     DryRun                      = [bool]$DryRun
+    SevenZipPath                = $SevenZipPath
     IncludeProjectsWithoutEmail = $IncludeProjectsWithoutEmail
 
     # Liste 1: eine Zeile pro Projekt, sortiert nach Projektname
@@ -126,11 +137,6 @@ function Write-LogMessage {
 }
 
 function Initialize-Directories {
-    $OutDir = Split-Path $Config.CsvByProjectPath
-    if (-not (Test-Path $OutDir)) {
-        New-Item -Path $OutDir -ItemType Directory -Force | Out-Null
-    }
-
     $Ok = $true
     foreach ($P in $Config.SearchPath) {
         if (-not (Test-Path -LiteralPath $P -PathType Container)) {
@@ -258,14 +264,48 @@ function Read-InfoFile {
     return [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
 }
 
-# Liest die ProjectInfo.xml aus einem .zw1-Archiv (ZIP) als Text
+# Sucht 7z.exe: Parameter -> Programme -> PATH
+function Find-SevenZip {
+    $Candidates = @(
+        $Config.SevenZipPath,
+        (Join-Path $env:ProgramFiles '7-Zip\7z.exe'),
+        $(if (${env:ProgramFiles(x86)}) { Join-Path ${env:ProgramFiles(x86)} '7-Zip\7z.exe' })
+    ) | Where-Object { $_ }
+
+    foreach ($C in $Candidates) {
+        if (Test-Path -LiteralPath $C -PathType Leaf) { return (Resolve-Path -LiteralPath $C).Path }
+    }
+    foreach ($Name in @('7z', '7za', '7zz')) {
+        $Cmd = Get-Command $Name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($Cmd) { return $Cmd.Source }
+    }
+    return $null
+}
+
+# Erkennt das Archivformat an den ersten Bytes (nicht an der Endung)
+function Get-ArchiveFormat {
+    param([string]$Path)
+
+    $Buffer = New-Object byte[] 6
+    $Stream = [System.IO.File]::OpenRead($Path)
+    try   { $Read = $Stream.Read($Buffer, 0, 6) }
+    finally { $Stream.Dispose() }
+
+    if ($Read -ge 6 -and $Buffer[0] -eq 0x37 -and $Buffer[1] -eq 0x7A -and $Buffer[2] -eq 0xBC -and
+        $Buffer[3] -eq 0xAF -and $Buffer[4] -eq 0x27 -and $Buffer[5] -eq 0x1C) { return '7z' }
+    if ($Read -ge 2 -and $Buffer[0] -eq 0x50 -and $Buffer[1] -eq 0x4B) { return 'zip' }
+    return 'unbekannt'
+}
+
+# ZIP: ProjectInfo.xml direkt aus dem Archiv lesen (ohne Entpacken)
 function Read-InfoFromZip {
     param([string]$ArchivePath)
 
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $Zip = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
     try {
-        $Entry = $Zip.Entries | Where-Object { $InfoFileNames -contains $_.Name } | Select-Object -First 1
+        $Entry = $Zip.Entries | Where-Object { $InfoFileNames -contains $_.Name } |
+            Sort-Object { $_.FullName.Length } | Select-Object -First 1
         if (-not $Entry) { return $null }
 
         $Reader = New-Object System.IO.StreamReader($Entry.Open(), [System.Text.Encoding]::UTF8, $true)
@@ -273,6 +313,44 @@ function Read-InfoFromZip {
         finally { $Reader.Dispose() }
     }
     finally { $Zip.Dispose() }
+}
+
+# 7z: nur die ProjectInfo.xml in einen Temp-Ordner entpacken und lesen
+function Read-InfoFrom7z {
+    param([string]$ArchivePath)
+
+    if (-not $Script:SevenZipExe) {
+        throw "7z-Archiv, aber 7-Zip wurde nicht gefunden (Parameter -SevenZipPath angeben)"
+    }
+
+    $Tmp = Join-Path ([System.IO.Path]::GetTempPath()) "EPLAN_Info_$([guid]::NewGuid())"
+    New-Item -Path $Tmp -ItemType Directory -Force | Out-Null
+    try {
+        # e = ohne Ordnerstruktur, -r = auch in Unterordnern, -y = nicht nachfragen
+        $Args7z = @('e', $ArchivePath, "-o$Tmp", '-y', '-r', '-bso0', '-bsp0') + $InfoFileNames
+        $Err = & $Script:SevenZipExe @Args7z 2>&1
+        if ($LASTEXITCODE -gt 1) {
+            throw "7-Zip Fehler ($LASTEXITCODE): $(($Err | Out-String).Trim())"
+        }
+
+        $XmlFile = Get-ChildItem -LiteralPath $Tmp -File | Select-Object -First 1
+        if (-not $XmlFile) { return $null }
+        return Read-InfoFile $XmlFile.FullName
+    }
+    finally {
+        Remove-Item -LiteralPath $Tmp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Liest die ProjectInfo.xml aus einem .zw1-Archiv (7z oder ZIP)
+function Read-InfoFromArchive {
+    param([string]$ArchivePath)
+
+    switch (Get-ArchiveFormat $ArchivePath) {
+        '7z'    { return Read-InfoFrom7z  $ArchivePath }
+        'zip'   { return Read-InfoFromZip $ArchivePath }
+        default { throw "Unbekanntes Archivformat" }
+    }
 }
 
 # ============================================================================
@@ -337,7 +415,7 @@ function Read-EplanProject {
             $Text = Read-InfoFile $XmlPath
         }
         else {
-            $Text = Read-InfoFromZip $File.FullName
+            $Text = Read-InfoFromArchive $File.FullName
             if (-not $Text) {
                 $Result.Error = "ProjectInfo.xml fehlt im Archiv"
                 Write-LogMessage "ProjectInfo.xml nicht im Archiv '$ProjectName' gefunden" "WARN"
@@ -462,6 +540,12 @@ function Export-List {
 # ============================================================================
 
 function Start-EplanUserCollector {
+    # Ausgabeverzeichnis zuerst anlegen, damit schon die ersten Log-Zeilen landen
+    $OutDir = Split-Path $Config.LogPath
+    if (-not (Test-Path -LiteralPath $OutDir)) {
+        New-Item -Path $OutDir -ItemType Directory -Force | Out-Null
+    }
+
     Write-LogMessage "EPLAN Projekt-/Benutzerliste gestartet"
     Write-LogMessage "  Suchpfad(e):   $($Config.SearchPath -join '; ')"
     Write-LogMessage "  Ausnahmeliste: $($Config.ExclusionFile)"
@@ -471,6 +555,10 @@ function Start-EplanUserCollector {
         Write-LogMessage "Initialisierung fehlgeschlagen. Abbruch." "ERROR"
         return
     }
+
+    $Script:SevenZipExe = Find-SevenZip
+    if ($Script:SevenZipExe) { Write-LogMessage "  7-Zip:         $($Script:SevenZipExe)" }
+    else { Write-LogMessage "7-Zip nicht gefunden - .zw1-Archive im 7z-Format können nicht gelesen werden" "WARN" }
 
     $Exclusions = Read-Exclusions
     $Excluded   = New-Object System.Collections.Generic.List[object]
@@ -543,5 +631,9 @@ Start-EplanUserCollector
 # Die E-Mail ist die des letzten Bearbeiters (Property-ID 3013); für den
 # Ersteller (ID 10020) speichert EPLAN nur die Kennung, keine E-Mail.
 #
-# Nur Lesezugriff, keine externen Abhängigkeiten (PowerShell 5.1+).
+# .zw1-Archive sind 7z-Archive. Dafür wird 7-Zip benötigt (wird automatisch
+# unter "C:\Program Files\7-Zip" bzw. im PATH gesucht, sonst -SevenZipPath).
+# Es wird nur die ProjectInfo.xml in einen Temp-Ordner entpackt.
+#
+# Nur Lesezugriff auf die Projekte. PowerShell 5.1+.
 # ============================================================================
