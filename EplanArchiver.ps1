@@ -1,543 +1,353 @@
+﻿# ============================================================================
+# EPLAN Projekt-/Benutzerliste
 # ============================================================================
-
-# EPLAN Projekt Archivierungstool
-
-# ============================================================================
-
-# Automatisches Finden und Verschieben alter EPLAN-Projekte
-
-# Erstellt von: PowerShell Script
-
-# Version: 1.0
-
+# Durchsucht ein Verzeichnis nach EPLAN-Projekten (.elk/.edb und .zw1),
+# liest die ProjektInfo.xml und sammelt Projektname + Benutzer-E-Mail-Adressen.
+# Ergebnis: geordnete Listen als CSV (Excel-kompatibel, Trennzeichen ';').
+#
+# Es werden KEINE Projekte verschoben, kopiert oder verändert (nur Lesezugriff).
+#
+# Version: 2.0
 # ============================================================================
 
 #Requires -Version 5.1
 
-# Globale Variablen und Konfiguration
+[CmdletBinding()]
+param(
+    # Quellverzeichnis für die Suche
+    [string]$SourcePath = "C:\EPLAN_Projekte",
+
+    # Ausgabeverzeichnis für die Listen
+    [string]$OutputPath = "C:\Temp",
+
+    # Projekte ohne gefundene E-Mail-Adresse trotzdem aufführen
+    [bool]$IncludeProjectsWithoutEmail = $true
+)
 
 # ============================================================================
-
-# KONFIGURATION - Hier können Sie die Einstellungen anpassen
+# KONFIGURATION
+# ============================================================================
 
 $Config = @{
-# Quellverzeichnis für die Suche (hier anpassen!)
-SourcePath = “C:\EPLAN_Projekte”
+    SourcePath                  = $SourcePath
+    IncludeProjectsWithoutEmail = $IncludeProjectsWithoutEmail
 
-```
-# Zielverzeichnis für alte Projekte (hier anpassen!)
-ArchivePath = "C:\EPLAN_Archiv"
+    # Liste 1: eine Zeile pro Projekt + E-Mail, sortiert nach Projekt, dann E-Mail
+    CsvByProjectPath = Join-Path $OutputPath "EPLAN_Projekte_Benutzer.csv"
 
-# Anzahl Monate für "alte" Projekte
-MonthsOld = 6
+    # Liste 2: eine Zeile pro E-Mail mit allen zugehörigen Projekten
+    CsvByUserPath    = Join-Path $OutputPath "EPLAN_Benutzer_Projekte.csv"
 
-# Dry-Run Modus (True = nur testen, False = tatsächlich verschieben)
-DryRun = $true
-
-# CSV-Datei für Berichte
-CsvReportPath = "C:\Temp\EPLAN_Archiv_Report.csv"
-
-# Log-Datei
-LogPath = "C:\Temp\EPLAN_Archiver.log"
-```
-
+    LogPath          = Join-Path $OutputPath "EPLAN_Archiver.log"
 }
 
-# Globale Variablen
-
-$Global:FoundProjects = @()
-$Global:ProcessedProjects = @()
+# Muster für E-Mail-Adressen
+$EmailRegex = [regex]'(?i)[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}'
 
 # ============================================================================
-
 # HILFSFUNKTIONEN
-
 # ============================================================================
-
-# Funktion: Schreibt Nachrichten in Log-Datei und Konsole
 
 function Write-LogMessage {
-param(
-[string]$Message,
-[string]$Level = “INFO”
-)
+    param(
+        [string]$Message,
+        [string]$Level = "INFO"
+    )
 
-```
-$TimeStamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-$LogEntry = "[$TimeStamp] [$Level] $Message"
+    $TimeStamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $LogEntry  = "[$TimeStamp] [$Level] $Message"
 
-# In Konsole ausgeben
-switch ($Level) {
-    "ERROR" { Write-Host $LogEntry -ForegroundColor Red }
-    "WARN"  { Write-Host $LogEntry -ForegroundColor Yellow }
-    "INFO"  { Write-Host $LogEntry -ForegroundColor Green }
-    default { Write-Host $LogEntry }
-}
+    switch ($Level) {
+        "ERROR" { Write-Host $LogEntry -ForegroundColor Red }
+        "WARN"  { Write-Host $LogEntry -ForegroundColor Yellow }
+        default { Write-Host $LogEntry -ForegroundColor Green }
+    }
 
-# In Log-Datei schreiben
-try {
-    Add-Content -Path $Config.LogPath -Value $LogEntry -Encoding UTF8
-}
-catch {
-    Write-Host "Fehler beim Schreiben in Log-Datei: $_" -ForegroundColor Red
-}
-```
-
-}
-
-# Funktion: Überprüft und erstellt notwendige Verzeichnisse
-
-function Initialize-Directories {
-Write-LogMessage “Initialisiere Verzeichnisse…”
-
-```
-# Prüfe Quellverzeichnis
-if (-not (Test-Path $Config.SourcePath)) {
-    Write-LogMessage "FEHLER: Quellverzeichnis '$($Config.SourcePath)' existiert nicht!" "ERROR"
-    return $false
-}
-
-# Erstelle Zielverzeichnis falls notwendig
-if (-not (Test-Path $Config.ArchivePath)) {
     try {
-        New-Item -Path $Config.ArchivePath -ItemType Directory -Force | Out-Null
-        Write-LogMessage "Zielverzeichnis '$($Config.ArchivePath)' erstellt."
+        Add-Content -Path $Config.LogPath -Value $LogEntry -Encoding UTF8
     }
     catch {
-        Write-LogMessage "FEHLER: Kann Zielverzeichnis nicht erstellen: $_" "ERROR"
+        Write-Host "Fehler beim Schreiben in Log-Datei: $_" -ForegroundColor Red
+    }
+}
+
+function Initialize-Directories {
+    $OutDir = Split-Path $Config.CsvByProjectPath
+    if (-not (Test-Path $OutDir)) {
+        New-Item -Path $OutDir -ItemType Directory -Force | Out-Null
+    }
+
+    if (-not (Test-Path $Config.SourcePath)) {
+        Write-LogMessage "FEHLER: Quellverzeichnis '$($Config.SourcePath)' existiert nicht!" "ERROR"
         return $false
     }
+    return $true
 }
-
-# Erstelle Temp-Verzeichnis für Log
-$TempDir = Split-Path $Config.LogPath
-if (-not (Test-Path $TempDir)) {
-    New-Item -Path $TempDir -ItemType Directory -Force | Out-Null
-}
-
-return $true
-```
-
-}
-
-# Funktion: Parst das Unix-Timestamp aus der XML
 
 function ConvertFrom-UnixTimestamp {
-param([string]$UnixTimestamp)
+    param([string]$UnixTimestamp)
 
-```
-try {
-    $UnixTime = [long]$UnixTimestamp
-    $DateTime = [datetime]'1970-01-01 00:00:00'
-    return $DateTime.AddSeconds($UnixTime)
-}
-catch {
-    Write-LogMessage "Fehler beim Konvertieren des Timestamps '$UnixTimestamp': $_" "WARN"
-    return $null
-}
-```
-
-}
-
-# Funktion: Extrahiert Informationen aus ProjektInfo.xml
-
-function Get-ProjectInfoFromXml {
-param(
-[string]$XmlPath,
-[string]$ProjectName
-)
-
-```
-try {
-    if (-not (Test-Path $XmlPath)) {
-        Write-LogMessage "ProjektInfo.xml nicht gefunden: $XmlPath" "WARN"
+    try {
+        return ([datetime]'1970-01-01 00:00:00').AddSeconds([long]$UnixTimestamp)
+    }
+    catch {
         return $null
     }
-    
-    [xml]$XmlContent = Get-Content $XmlPath -Encoding UTF8
-    
-    # Suche nach Modification Date Property
-    $ModificationProperty = $XmlContent.SelectSingleNode("//Property[@name='Modification date']")
-    
-    if ($ModificationProperty) {
-        $UnixTimestamp = $ModificationProperty.InnerText
-        $ModificationDate = ConvertFrom-UnixTimestamp $UnixTimestamp
-        
-        if ($ModificationDate) {
-            Write-LogMessage "Projekt '$ProjectName': Letzte Änderung am $($ModificationDate.ToString('dd.MM.yyyy HH:mm:ss'))"
-            
-            return @{
-                ProjectName = $ProjectName
-                ModificationDate = $ModificationDate
-                UnixTimestamp = $UnixTimestamp
-                XmlPath = $XmlPath
+}
+
+# Liefert den Property-Namen eines Knotens (Attribut name/id), falls vorhanden
+function Get-PropertyLabel {
+    param([System.Xml.XmlNode]$Node)
+
+    foreach ($AttrName in @('name', 'Name', 'id', 'ID')) {
+        if ($Node.Attributes -and $Node.Attributes[$AttrName]) {
+            return $Node.Attributes[$AttrName].Value
+        }
+    }
+    return $Node.LocalName
+}
+
+# Wertet den XML-Inhalt einer ProjektInfo.xml aus:
+# alle E-Mail-Adressen (aus Elementtexten und Attributen) + Änderungsdatum
+function Get-ProjectInfoFromXmlContent {
+    param(
+        [xml]$XmlContent,
+        [string]$ProjectName
+    )
+
+    $Emails = @{}   # Key = E-Mail (klein), Value = Liste der Fundstellen
+
+    foreach ($Node in $XmlContent.SelectNodes("//*")) {
+        # Nur direkter Text des Knotens (nicht der Kinder)
+        $OwnText = ($Node.ChildNodes |
+            Where-Object { $_.NodeType -eq 'Text' -or $_.NodeType -eq 'CDATA' } |
+            ForEach-Object { $_.Value }) -join ' '
+
+        $Sources = @()
+        if ($OwnText) { $Sources += , @($OwnText, (Get-PropertyLabel $Node)) }
+        if ($Node.Attributes) {
+            foreach ($Attr in $Node.Attributes) {
+                $Sources += , @($Attr.Value, "$(Get-PropertyLabel $Node)@$($Attr.Name)")
+            }
+        }
+
+        foreach ($Src in $Sources) {
+            foreach ($Match in $EmailRegex.Matches($Src[0])) {
+                $Mail = $Match.Value.ToLowerInvariant().TrimEnd('.')
+                if (-not $Emails.ContainsKey($Mail)) { $Emails[$Mail] = New-Object System.Collections.Generic.List[string] }
+                if (-not $Emails[$Mail].Contains($Src[1])) { $Emails[$Mail].Add($Src[1]) }
             }
         }
     }
-    else {
-        Write-LogMessage "Keine Modification Date in XML gefunden für Projekt '$ProjectName'" "WARN"
+
+    $ModificationDate = $null
+    $ModNode = $XmlContent.SelectSingleNode("//Property[@name='Modification date']")
+    if ($ModNode) { $ModificationDate = ConvertFrom-UnixTimestamp $ModNode.InnerText }
+
+    return @{
+        Emails           = $Emails
+        ModificationDate = $ModificationDate
     }
 }
-catch {
-    Write-LogMessage "Fehler beim Lesen der XML '$XmlPath': $_" "ERROR"
+
+function Read-XmlFile {
+    param([string]$Path)
+    # Encoding aus der XML-Deklaration respektieren
+    $Doc = New-Object System.Xml.XmlDocument
+    $Doc.Load($Path)
+    return $Doc
 }
 
-return $null
-```
+function Read-XmlFromZip {
+    param([string]$ArchivePath)
 
-}
-
-# Funktion: Extrahiert ProjektInfo.xml aus .zw1 Archive (nur native PowerShell)
-
-function Get-ProjectInfoFromArchive {
-param(
-[string]$ArchivePath,
-[string]$ProjectName
-)
-
-```
-try {
-    Write-LogMessage "Versuche Archiv-Extraktion für: $ProjectName"
-    
-    # Temporäres Verzeichnis für Extraktion
-    $TempExtractPath = Join-Path $env:TEMP "EPLAN_Extract_$([System.Guid]::NewGuid())"
-    New-Item -Path $TempExtractPath -ItemType Directory -Force | Out-Null
-    
-    # .zw1 Dateien sind oft ZIP-Archive mit anderem Namen
     Add-Type -AssemblyName System.IO.Compression.FileSystem
-    $ZipArchive = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
-    
-    # Suche nach ProjektInfo.xml im Archiv
-    $XmlEntry = $ZipArchive.Entries | Where-Object { $_.Name -eq "ProjektInfo.xml" }
-    
-    if ($XmlEntry) {
-        $XmlPath = Join-Path $TempExtractPath "ProjektInfo.xml"
-        [System.IO.Compression.ZipFileExtensions]::ExtractToFile($XmlEntry, $XmlPath, $true)
-        $ZipArchive.Dispose()
-        
-        if (Test-Path $XmlPath) {
-            $ProjectInfo = Get-ProjectInfoFromXml -XmlPath $XmlPath -ProjectName $ProjectName
-            
-            # Cleanup
-            Remove-Item $TempExtractPath -Recurse -Force -ErrorAction SilentlyContinue
-            
-            return $ProjectInfo
+    $Zip = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
+    try {
+        $Entry = $Zip.Entries | Where-Object { $_.Name -eq "ProjektInfo.xml" } | Select-Object -First 1
+        if (-not $Entry) { return $null }
+
+        $Stream = $Entry.Open()
+        try {
+            $Doc = New-Object System.Xml.XmlDocument
+            $Doc.Load($Stream)
+            return $Doc
         }
+        finally { $Stream.Dispose() }
     }
-    else {
-        Write-LogMessage "ProjektInfo.xml nicht im Archiv gefunden: $ProjectName" "WARN"
-        $ZipArchive.Dispose()
-    }
-    
-    # Cleanup bei Fehler
-    Remove-Item $TempExtractPath -Recurse -Force -ErrorAction SilentlyContinue
-}
-catch {
-    Write-LogMessage "Archiv '$ArchivePath' konnte nicht verarbeitet werden (möglicherweise kein ZIP-Format): $_" "WARN"
-}
-
-return $null
-```
-
+    finally { $Zip.Dispose() }
 }
 
 # ============================================================================
-
 # HAUPTFUNKTIONEN
-
 # ============================================================================
-
-# Funktion: Sucht nach EPLAN-Projekten im Verzeichnis
 
 function Find-EplanProjects {
-param([string]$SearchPath)
+    param([string]$SearchPath)
 
-```
-Write-LogMessage "Durchsuche Verzeichnis: $SearchPath"
+    Write-LogMessage "Durchsuche Verzeichnis: $SearchPath"
+    $Results = New-Object System.Collections.Generic.List[object]
 
-$FoundProjects = @()
-$CutoffDate = (Get-Date).AddMonths(-$Config.MonthsOld)
-
-try {
-    # Suche nach .elk Dateien (EPLAN Projekte)
-    $ElkFiles = Get-ChildItem -Path $SearchPath -Filter "*.elk" -Recurse -ErrorAction SilentlyContinue
-    
+    # --- Normale Projekte (.elk + .edb\ProjektInfo.xml) ---
+    $ElkFiles = Get-ChildItem -Path $SearchPath -Filter "*.elk" -Recurse -File -ErrorAction SilentlyContinue
     foreach ($ElkFile in $ElkFiles) {
         $ProjectName = [System.IO.Path]::GetFileNameWithoutExtension($ElkFile.Name)
-        $ProjectDir = Join-Path $ElkFile.Directory.FullName "$ProjectName.edb"
-        
-        Write-LogMessage "Gefundenes Projekt: $ProjectName"
-        
-        # Prüfe ob .edb Verzeichnis existiert
-        if (Test-Path $ProjectDir) {
-            # Suche nach ProjektInfo.xml im .edb Verzeichnis
-            $XmlPath = Join-Path $ProjectDir "ProjektInfo.xml"
-            $ProjectInfo = Get-ProjectInfoFromXml -XmlPath $XmlPath -ProjectName $ProjectName
-            
-            if ($ProjectInfo -and $ProjectInfo.ModificationDate -lt $CutoffDate) {
-                $FoundProjects += @{
-                    ProjectName = $ProjectName
-                    ElkPath = $ElkFile.FullName
-                    EdbPath = $ProjectDir
-                    ModificationDate = $ProjectInfo.ModificationDate
-                    Type = "Standard"
-                    OriginalPath = $ElkFile.Directory.FullName
-                }
-                Write-LogMessage "Projekt '$ProjectName' ist älter als $($Config.MonthsOld) Monate und wird archiviert."
-            }
-            elseif ($ProjectInfo) {
-                Write-LogMessage "Projekt '$ProjectName' ist noch aktuell (geändert: $($ProjectInfo.ModificationDate.ToString('dd.MM.yyyy')))"
-            }
+        $XmlPath     = Join-Path $ElkFile.Directory.FullName "$ProjectName.edb\ProjektInfo.xml"
+
+        if (-not (Test-Path $XmlPath)) {
+            Write-LogMessage "ProjektInfo.xml nicht gefunden für '$ProjectName': $XmlPath" "WARN"
+            $Results.Add(@{ ProjectName = $ProjectName; Type = "Projekt"; Path = $ElkFile.FullName; Info = $null; Error = "ProjektInfo.xml fehlt" })
+            continue
         }
-        else {
-            Write-LogMessage "Warnung: .edb Verzeichnis für '$ProjectName' nicht gefunden!" "WARN"
+
+        try {
+            $Info = Get-ProjectInfoFromXmlContent -XmlContent (Read-XmlFile $XmlPath) -ProjectName $ProjectName
+            Write-LogMessage "Projekt '$ProjectName': $($Info.Emails.Count) E-Mail-Adresse(n)"
+            $Results.Add(@{ ProjectName = $ProjectName; Type = "Projekt"; Path = $ElkFile.FullName; Info = $Info; Error = "" })
+        }
+        catch {
+            Write-LogMessage "Fehler beim Lesen von '$XmlPath': $_" "ERROR"
+            $Results.Add(@{ ProjectName = $ProjectName; Type = "Projekt"; Path = $ElkFile.FullName; Info = $null; Error = $_.Exception.Message })
         }
     }
-    
-    # Suche nach .zw1 Dateien (EPLAN Archive)
-    $ZwFiles = Get-ChildItem -Path $SearchPath -Filter "*.zw1" -Recurse -ErrorAction SilentlyContinue
-    
+
+    # --- Projektarchive (.zw1) ---
+    $ZwFiles = Get-ChildItem -Path $SearchPath -Filter "*.zw1" -Recurse -File -ErrorAction SilentlyContinue
     foreach ($ZwFile in $ZwFiles) {
         $ProjectName = [System.IO.Path]::GetFileNameWithoutExtension($ZwFile.Name)
-        
-        Write-LogMessage "Gefundenes Archiv: $ProjectName"
-        
-        $ProjectInfo = Get-ProjectInfoFromArchive -ArchivePath $ZwFile.FullName -ProjectName $ProjectName
-        
-        if ($ProjectInfo -and $ProjectInfo.ModificationDate -lt $CutoffDate) {
-            $FoundProjects += @{
-                ProjectName = $ProjectName
-                ArchivePath = $ZwFile.FullName
-                ModificationDate = $ProjectInfo.ModificationDate
-                Type = "Archive"
-                OriginalPath = $ZwFile.Directory.FullName
+        try {
+            $Doc = Read-XmlFromZip $ZwFile.FullName
+            if (-not $Doc) {
+                Write-LogMessage "ProjektInfo.xml nicht im Archiv '$ProjectName' gefunden" "WARN"
+                $Results.Add(@{ ProjectName = $ProjectName; Type = "Archiv"; Path = $ZwFile.FullName; Info = $null; Error = "ProjektInfo.xml fehlt im Archiv" })
+                continue
             }
-            Write-LogMessage "Archiv '$ProjectName' ist älter als $($Config.MonthsOld) Monate und wird archiviert."
+            $Info = Get-ProjectInfoFromXmlContent -XmlContent $Doc -ProjectName $ProjectName
+            Write-LogMessage "Archiv '$ProjectName': $($Info.Emails.Count) E-Mail-Adresse(n)"
+            $Results.Add(@{ ProjectName = $ProjectName; Type = "Archiv"; Path = $ZwFile.FullName; Info = $Info; Error = "" })
         }
-        elseif ($ProjectInfo) {
-            Write-LogMessage "Archiv '$ProjectName' ist noch aktuell (geändert: $($ProjectInfo.ModificationDate.ToString('dd.MM.yyyy')))"
-        }
-    }
-    
-}
-catch {
-    Write-LogMessage "Fehler beim Durchsuchen von '$SearchPath': $_" "ERROR"
-}
-
-Write-LogMessage "Gefunden: $($FoundProjects.Count) alte Projekte zum Archivieren"
-return $FoundProjects
-```
-
-}
-
-# Funktion: Verschiebt ein einzelnes Projekt
-
-function Move-Project {
-param(
-[hashtable]$Project,
-[bool]$DryRun = $true
-)
-
-```
-$ProjectName = $Project.ProjectName
-$TargetDir = Join-Path $Config.ArchivePath $ProjectName
-
-try {
-    if ($DryRun) {
-        Write-LogMessage "[DRY-RUN] Würde Projekt '$ProjectName' nach '$TargetDir' verschieben"
-        return @{
-            Success = $true
-            OriginalPath = $Project.OriginalPath
-            NewPath = $TargetDir
-            Action = "DRY-RUN"
+        catch {
+            Write-LogMessage "Archiv '$($ZwFile.FullName)' nicht lesbar (evtl. kein ZIP-Format): $_" "WARN"
+            $Results.Add(@{ ProjectName = $ProjectName; Type = "Archiv"; Path = $ZwFile.FullName; Info = $null; Error = $_.Exception.Message })
         }
     }
-    else {
-        # Erstelle Zielverzeichnis
-        if (-not (Test-Path $TargetDir)) {
-            New-Item -Path $TargetDir -ItemType Directory -Force | Out-Null
-        }
-        
-        if ($Project.Type -eq "Standard") {
-            # Verschiebe .elk Datei und .edb Verzeichnis
-            $TargetElk = Join-Path $TargetDir (Split-Path $Project.ElkPath -Leaf)
-            $TargetEdb = Join-Path $TargetDir (Split-Path $Project.EdbPath -Leaf)
-            
-            Move-Item -Path $Project.ElkPath -Destination $TargetElk -Force
-            Move-Item -Path $Project.EdbPath -Destination $TargetEdb -Force
-            
-            Write-LogMessage "Projekt '$ProjectName' erfolgreich nach '$TargetDir' verschoben"
-        }
-        else {
-            # Verschiebe .zw1 Archiv
-            $TargetArchive = Join-Path $TargetDir (Split-Path $Project.ArchivePath -Leaf)
-            Move-Item -Path $Project.ArchivePath -Destination $TargetArchive -Force
-            
-            Write-LogMessage "Archiv '$ProjectName' erfolgreich nach '$TargetDir' verschoben"
-        }
-        
-        return @{
-            Success = $true
-            OriginalPath = $Project.OriginalPath
-            NewPath = $TargetDir
-            Action = "MOVED"
-        }
-    }
-}
-catch {
-    Write-LogMessage "FEHLER beim Verschieben von Projekt '$ProjectName': $_" "ERROR"
-    return @{
-        Success = $false
-        OriginalPath = $Project.OriginalPath
-        NewPath = $TargetDir
-        Action = "ERROR"
-        Error = $_.Exception.Message
-    }
-}
-```
 
+    Write-LogMessage "Gefunden: $($Results.Count) Projekte/Archive"
+    return $Results
 }
 
-# Funktion: Erstellt CSV-Bericht
+# Liste 1: Projekt -> E-Mail (eine Zeile pro Kombination)
+function New-ProjectUserList {
+    param($Projects)
 
-function New-CsvReport {
-param([array]$ProcessedProjects)
+    $Rows = foreach ($P in $Projects) {
+        $ModDate = if ($P.Info -and $P.Info.ModificationDate) { $P.Info.ModificationDate.ToString('dd.MM.yyyy HH:mm') } else { "" }
 
-```
-Write-LogMessage "Erstelle CSV-Bericht..."
-
-try {
-    # CSV-Daten vorbereiten
-    $CsvData = @()
-    
-    foreach ($Project in $ProcessedProjects) {
-        $CsvData += [PSCustomObject]@{
-            'Projektname' = $Project.ProjectName
-            'Typ' = $Project.Type
-            'Letzte Änderung' = $Project.ModificationDate.ToString('dd.MM.yyyy HH:mm:ss')
-            'Ursprünglicher Pfad' = $Project.OriginalPath
-            'Neuer Pfad' = if($Project.Result.Success) { $Project.Result.NewPath } else { "FEHLER" }
-            'Aktion' = $Project.Result.Action
-            'Status' = if($Project.Result.Success) { "Erfolgreich" } else { "Fehlgeschlagen" }
-            'Fehler' = if($Project.Result.Error) { $Project.Result.Error } else { "" }
+        if ($P.Info -and $P.Info.Emails.Count -gt 0) {
+            foreach ($Mail in $P.Info.Emails.Keys) {
+                [PSCustomObject]@{
+                    'Projektname'     = $P.ProjectName
+                    'E-Mail'          = $Mail
+                    'Fundstelle'      = ($P.Info.Emails[$Mail] -join ', ')
+                    'Typ'             = $P.Type
+                    'Letzte Änderung' = $ModDate
+                    'Pfad'            = $P.Path
+                    'Hinweis'         = $P.Error
+                }
+            }
+        }
+        elseif ($Config.IncludeProjectsWithoutEmail) {
+            [PSCustomObject]@{
+                'Projektname'     = $P.ProjectName
+                'E-Mail'          = ""
+                'Fundstelle'      = ""
+                'Typ'             = $P.Type
+                'Letzte Änderung' = $ModDate
+                'Pfad'            = $P.Path
+                'Hinweis'         = if ($P.Error) { $P.Error } else { "Keine E-Mail gefunden" }
+            }
         }
     }
-    
-    # Erstelle CSV-Datei
-    $CsvData | Export-Csv -Path $Config.CsvReportPath -Delimiter ';' -Encoding UTF8 -NoTypeInformation
-    
-    Write-LogMessage "CSV-Bericht erstellt: $($Config.CsvReportPath)"
-    Write-LogMessage "Die CSV-Datei kann in Excel geöffnet werden."
-    
-}
-catch {
-    Write-LogMessage "Fehler beim Erstellen des CSV-Berichts: $_" "ERROR"
-}
-```
 
+    return @($Rows | Sort-Object 'Projektname', 'E-Mail', 'Pfad')
+}
+
+# Liste 2: E-Mail -> Projekte (eine Zeile pro Benutzer)
+function New-UserProjectList {
+    param($ProjectRows)
+
+    $ProjectRows |
+        Where-Object { $_.'E-Mail' } |
+        Group-Object 'E-Mail' |
+        Sort-Object Name |
+        ForEach-Object {
+            $Names = @($_.Group | Select-Object -ExpandProperty 'Projektname' | Sort-Object -Unique)
+            [PSCustomObject]@{
+                'E-Mail'        = $_.Name
+                'Anzahl'        = $Names.Count
+                'Projekte'      = ($Names -join ', ')
+            }
+        }
+}
+
+function Export-List {
+    param($Rows, [string]$Path)
+    if (-not $Rows) {
+        Write-LogMessage "Keine Daten für '$Path'." "WARN"
+        return
+    }
+    $Rows | Export-Csv -Path $Path -Delimiter ';' -Encoding UTF8 -NoTypeInformation
+    Write-LogMessage "Liste erstellt: $Path"
 }
 
 # ============================================================================
-
 # HAUPTPROGRAMM
-
 # ============================================================================
 
-function Start-EplanArchiver {
-Write-LogMessage “EPLAN Projekt Archivierungstool gestartet”
-Write-LogMessage “Konfiguration:”
-Write-LogMessage “  Quellpfad: $($Config.SourcePath)”
-Write-LogMessage “  Zielpfad: $($Config.ArchivePath)”
-Write-LogMessage “  Alter: $($Config.MonthsOld) Monate”
-Write-LogMessage “  Dry-Run: $($Config.DryRun)”
-Write-LogMessage “  CSV-Bericht: $($Config.CsvReportPath)”
+function Start-EplanUserCollector {
+    Write-LogMessage "EPLAN Projekt-/Benutzerliste gestartet"
+    Write-LogMessage "  Quellpfad: $($Config.SourcePath)"
 
-```
-# Initialisierung
-if (-not (Initialize-Directories)) {
-    Write-LogMessage "Initialisierung fehlgeschlagen. Abbruch." "ERROR"
-    return
-}
-
-# Projekte suchen
-$Global:FoundProjects = Find-EplanProjects -SearchPath $Config.SourcePath
-
-if ($Global:FoundProjects.Count -eq 0) {
-    Write-LogMessage "Keine alten Projekte gefunden."
-    return
-}
-
-# Projekte verarbeiten
-Write-LogMessage "Verarbeite $($Global:FoundProjects.Count) Projekte..."
-
-foreach ($Project in $Global:FoundProjects) {
-    $Result = Move-Project -Project $Project -DryRun $Config.DryRun
-    
-    $Global:ProcessedProjects += @{
-        ProjectName = $Project.ProjectName
-        Type = $Project.Type
-        ModificationDate = $Project.ModificationDate
-        OriginalPath = $Project.OriginalPath
-        Result = $Result
+    if (-not (Initialize-Directories)) {
+        Write-LogMessage "Initialisierung fehlgeschlagen. Abbruch." "ERROR"
+        return
     }
+
+    $Projects = Find-EplanProjects -SearchPath $Config.SourcePath
+    if ($Projects.Count -eq 0) {
+        Write-LogMessage "Keine EPLAN-Projekte gefunden."
+        return
+    }
+
+    $ByProject = New-ProjectUserList -Projects $Projects
+    $ByUser    = New-UserProjectList -ProjectRows $ByProject
+
+    Export-List -Rows $ByProject -Path $Config.CsvByProjectPath
+    Export-List -Rows $ByUser    -Path $Config.CsvByUserPath
+
+    $WithMail = @($Projects | Where-Object { $_.Info -and $_.Info.Emails.Count -gt 0 }).Count
+    Write-LogMessage "ZUSAMMENFASSUNG:"
+    Write-LogMessage "  Projekte gesamt:        $($Projects.Count)"
+    Write-LogMessage "  davon mit E-Mail:       $WithMail"
+    Write-LogMessage "  Eindeutige E-Mails:     $(@($ByUser).Count)"
+    Write-LogMessage "EPLAN Projekt-/Benutzerliste beendet"
 }
 
-# Bericht erstellen
-New-CsvReport -ProcessedProjects $Global:ProcessedProjects
-
-# Zusammenfassung
-$SuccessCount = ($Global:ProcessedProjects | Where-Object { $_.Result.Success }).Count
-$ErrorCount = ($Global:ProcessedProjects | Where-Object { -not $_.Result.Success }).Count
-
-Write-LogMessage "ZUSAMMENFASSUNG:"
-Write-LogMessage "  Verarbeitet: $($Global:ProcessedProjects.Count) Projekte"
-Write-LogMessage "  Erfolgreich: $SuccessCount"
-Write-LogMessage "  Fehler: $ErrorCount"
-
-if ($Config.DryRun) {
-    Write-LogMessage "Dies war ein DRY-RUN. Keine Dateien wurden verschoben."
-    Write-LogMessage "Setzen Sie `$Config.DryRun = `$false für den echten Lauf."
-}
-
-Write-LogMessage "EPLAN Projekt Archivierungstool beendet"
-```
-
-}
+Start-EplanUserCollector
 
 # ============================================================================
-
-# PROGRAMMSTART
-
+# VERWENDUNG
 # ============================================================================
-
-# Starte das Programm
-
-Start-EplanArchiver
-
-# ============================================================================
-
-# VERWENDUNG:
-
-# ============================================================================
-
-# 1. Passen Sie die Konfiguration am Anfang des Skripts an
-
-# 2. Führen Sie das Skript mit DryRun = $true aus zum Testen
-
-# 3. Prüfen Sie die Log-Datei und den CSV-Bericht
-
-# 4. Setzen Sie DryRun = $false für den echten Lauf
-
-# 5. Das Skript kann dann automatisch per Aufgabenplanung ausgeführt werden
-
-# 
-
-# KEINE EXTERNEN ABHÄNGIGKEITEN:
-
-# - Läuft mit Standard PowerShell 5.1+
-
-# - Verwendet nur native ZIP-Unterstützung
-
-# - Erstellt CSV-Berichte (öffnen sich in Excel)
-
+#   .\EplanArchiver.ps1
+#   .\EplanArchiver.ps1 -SourcePath "\\server\EPLAN\Projekte" -OutputPath "C:\Temp"
+#
+# Ausgabe:
+#   EPLAN_Projekte_Benutzer.csv  - Projekt | E-Mail | Fundstelle | ... (sortiert nach Projekt)
+#   EPLAN_Benutzer_Projekte.csv  - E-Mail | Anzahl | Projekte (sortiert nach E-Mail)
+#
+# Die Spalte "Fundstelle" zeigt, in welcher Property der ProjektInfo.xml die
+# Adresse stand (z. B. "Created by"). Damit lässt sich prüfen, ob die richtigen
+# Benutzerfelder erfasst werden.
+#
+# Nur Lesezugriff, keine externen Abhängigkeiten (PowerShell 5.1+).
 # ============================================================================
